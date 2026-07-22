@@ -156,12 +156,14 @@ const COA_MAP = {"1106.00.00":"PERSEDIAAN","1106.01.00":"PERSEDIAAN BAHAN BAKAR"
 
   let state = JSON.parse(JSON.stringify(SEED_DATA));
   state.categories = { kebun: [...DEFAULT_CATEGORIES.kebun], dapur: [...DEFAULT_CATEGORIES.dapur] };
+  state.shipments = [];
   let ui = {
     page: "dashboard",
     sidebarOpen: false,
     filterKas: "semua",
     filterPeriod: "auto",
     importPreview: null,
+    reconOpen: {},
     toast: ""
   };
 
@@ -176,6 +178,68 @@ const COA_MAP = {"1106.00.00":"PERSEDIAAN","1106.01.00":"PERSEDIAAN BAHAN BAKAR"
     return d.toLocaleDateString("id-ID", { day: "2-digit", month: "long", year: "numeric" });
   }
 
+  // ===== AUTO-FETCH DATA DARI GITHUB (tidak perlu impor manual lagi) =====
+  // Ganti nilai ini kalau nama repo/branch berubah.
+  const GITHUB_OWNER = "tayanplantation";
+  const GITHUB_REPO = "tayanplantation";
+  const GITHUB_BRANCH = "main";
+  const FILE_KAS_KECIL = "data-kas-kecil.xlsx";
+  const FILE_PENGIRIMAN = "data-pengiriman.xlsx";
+
+  function githubRawUrl(filename) {
+    return `https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_BRANCH}/${filename}?t=${Date.now()}`;
+  }
+
+  function parseKasKecilWorkbook(wb) {
+    const out = { kebun: [], dapur: [], saldoKebun: null, saldoDapur: null };
+    for (const sheetName of wb.SheetNames) {
+      const kas = detectKas(sheetName);
+      if (!kas) continue;
+      const aoa = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, raw: true, defval: null });
+      const blocks = parseSheetBlocks(aoa);
+      const tx = toTx(kas, blocks);
+      out[kas] = out[kas].concat(tx);
+      if (tx.length) out[kas === "kebun" ? "saldoKebun" : "saldoDapur"] = tx[tx.length - 1].saldoFromFile;
+    }
+    return out;
+  }
+
+  async function fetchWorkbook(filename) {
+    const res = await fetch(githubRawUrl(filename), { cache: "no-store" });
+    if (!res.ok) throw new Error(res.status === 404 ? "File belum ada di GitHub" : "HTTP " + res.status);
+    const buf = await res.arrayBuffer();
+    return XLSX.read(buf, { type: "array" });
+  }
+
+  async function autoFetchFromGithub(silent) {
+    if (typeof XLSX === "undefined") return;
+    ui.fetchStatus = "loading";
+    if (!silent) render();
+    let anySuccess = false;
+    try {
+      const wb = await fetchWorkbook(FILE_KAS_KECIL);
+      const parsed = parseKasKecilWorkbook(wb);
+      if (parsed.kebun.length) { state.kebun.tx = parsed.kebun; if (parsed.saldoKebun !== null) state.kebun.saldo = parsed.saldoKebun; }
+      if (parsed.dapur.length) { state.dapur.tx = parsed.dapur; if (parsed.saldoDapur !== null) state.dapur.saldo = parsed.saldoDapur; }
+      anySuccess = true;
+    } catch (e) { console.log("Belum bisa ambil " + FILE_KAS_KECIL + ":", e.message); }
+
+    try {
+      const wb2 = await fetchWorkbook(FILE_PENGIRIMAN);
+      const shipments = parseShipmentWorkbook(wb2);
+      if (shipments.length) { state.shipments = shipments; anySuccess = true; }
+    } catch (e) { console.log("Belum bisa ambil " + FILE_PENGIRIMAN + ":", e.message); }
+
+    if (anySuccess) {
+      saveState();
+      ui.lastUpdated = new Date();
+      ui.fetchStatus = "ok";
+    } else {
+      ui.fetchStatus = "gagal";
+    }
+    render();
+  }
+
   async function loadState() {
     try {
       const raw = localStorage.getItem("kas-state");
@@ -183,9 +247,12 @@ const COA_MAP = {"1106.00.00":"PERSEDIAAN","1106.01.00":"PERSEDIAAN BAHAN BAKAR"
         const loaded = JSON.parse(raw);
         state = { ...state, ...loaded };
         if (!state.categories) state.categories = { kebun: [...DEFAULT_CATEGORIES.kebun], dapur: [...DEFAULT_CATEGORIES.dapur] };
+        if (!state.shipments) state.shipments = [];
       }
     } catch (e) { /* belum ada data tersimpan, pakai default */ }
     render();
+    autoFetchFromGithub(true); // ambil versi terbaru dari GitHub di belakang layar
+    setInterval(() => autoFetchFromGithub(true), 5 * 60 * 1000); // auto-refresh tiap 5 menit
   }
   async function saveState() {
     try { localStorage.setItem("kas-state", JSON.stringify(state)); }
@@ -496,6 +563,161 @@ const COA_MAP = {"1106.00.00":"PERSEDIAAN","1106.01.00":"PERSEDIAAN BAHAN BAKAR"
     return out;
   }
 
+  // ===== REKONSILIASI PENGIRIMAN vs PEMBAYARAN =====
+
+  function parseShipmentWorkbook(wb) {
+    const shipments = [];
+    for (const sheetName of wb.SheetNames) {
+      const aoa = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1, raw: true, defval: null });
+      let headerRow = -1, colTgl = -1, colPlat = -1, colPabrik = -1, colSupir = -1;
+      for (let r = 0; r < Math.min(aoa.length, 10); r++) {
+        const row = aoa[r] || [];
+        const idxTgl = row.findIndex(c => typeof c === "string" && c.trim().toUpperCase() === "TANGGAL");
+        const idxPlat = row.findIndex(c => typeof c === "string" && c.trim().toUpperCase().includes("PLAT"));
+        if (idxTgl >= 0 && idxPlat >= 0) {
+          headerRow = r; colTgl = idxTgl; colPlat = idxPlat;
+          colPabrik = row.findIndex(c => typeof c === "string" && c.trim().toUpperCase() === "PABRIK");
+          colSupir = row.findIndex(c => typeof c === "string" && c.trim().toUpperCase().includes("SUPIR"));
+          break;
+        }
+      }
+      if (headerRow < 0) continue;
+      for (let r = headerRow + 1; r < aoa.length; r++) {
+        const row = aoa[r];
+        if (!row) continue;
+        const serial = row[colTgl];
+        const plat = row[colPlat];
+        if (typeof serial !== "number" || !plat) continue;
+        shipments.push({
+          ts: excelSerialToUTCTs(serial),
+          plat: String(plat).trim(),
+          pabrik: colPabrik >= 0 ? String(row[colPabrik] || "").trim() : "",
+          supir: colSupir >= 0 ? String(row[colSupir] || "").trim() : ""
+        });
+      }
+    }
+    return shipments;
+  }
+
+  function extractPlatFromKet(ket) {
+    const m = ket.match(/\bB\s?\d{3,4}\s?[A-Z]{2,3}\b/);
+    return m ? m[0].replace(/\s+/g, " ").trim() : null;
+  }
+  const BULAN_MAP = { JANUARI: 0, FEBRUARI: 1, MARET: 2, APRIL: 3, MEI: 4, JUNI: 5, JULI: 6, AGUSTUS: 7, SEPTEMBER: 8, OKTOBER: 9, NOVEMBER: 10, DESEMBER: 11 };
+  function extractTglOverrideFromKet(ket) {
+    const m = ket.match(/TGL\s+(\d{1,2})\s+(JANUARI|FEBRUARI|MARET|APRIL|MEI|JUNI|JULI|AGUSTUS|SEPTEMBER|OKTOBER|NOVEMBER|DESEMBER)\s+(\d{4})/i);
+    if (!m) return null;
+    return Date.UTC(Number(m[3]), BULAN_MAP[m[2].toUpperCase()], Number(m[1]));
+  }
+  function dateKeyUTC(ts) {
+    const d = new Date(ts);
+    return d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0");
+  }
+
+  // Hitung rekonsiliasi: bandingkan data pengiriman vs pembayaran uang makan & grading di Kas Kebun
+  function computeReconciliation() {
+    const shipments = state.shipments || [];
+    if (!shipments.length) return null;
+
+    // Kelompokkan pengiriman per (tanggal|plat)
+    const shipByKey = {};
+    for (const s of shipments) {
+      const key = dateKeyUTC(s.ts) + "|" + s.plat;
+      if (!shipByKey[key]) shipByKey[key] = { pabrik: new Set(), count: 0, ts: s.ts, plat: s.plat, supir: new Set() };
+      shipByKey[key].pabrik.add(s.pabrik);
+      if (s.supir) shipByKey[key].supir.add(s.supir);
+      shipByKey[key].count++;
+    }
+
+    // Pembayaran uang makan (VRA) & grading dari Kas Kebun — simpan detail transaksinya, bukan cuma jumlah
+    const makanByKey = {}, gradingByKey = {};
+    for (const t of state.kebun.tx) {
+      if (t.jenis !== "out") continue;
+      const plat = extractPlatFromKet(t.ket);
+      if (!plat) continue;
+      const override = extractTglOverrideFromKet(t.ket);
+      const effTs = override != null ? override : t.ts;
+      const key = dateKeyUTC(effTs) + "|" + plat;
+      if (t.kode.includes("VRA") && /UANG MAKAN/i.test(t.ket)) { (makanByKey[key] = makanByKey[key] || []).push(t); }
+      if (t.kode.includes("GRADING") && /GRADING/i.test(t.ket)) { (gradingByKey[key] = gradingByKey[key] || []).push(t); }
+    }
+
+    // Pola per PABRIK (dari kombinasi non-ambigu / 1 pabrik per truk-hari)
+    function buildPabrikStat(payMap) {
+      const stat = {};
+      for (const key in shipByKey) {
+        const s = shipByKey[key];
+        if (s.pabrik.size !== 1) continue;
+        const p = [...s.pabrik][0];
+        if (!stat[p]) stat[p] = { shipment: 0, dibayar: 0 };
+        stat[p].shipment++;
+        if ((payMap[key] || []).length > 0) stat[p].dibayar++;
+      }
+      return stat;
+    }
+    const statMakan = buildPabrikStat(makanByKey);
+    const statGrading = buildPabrikStat(gradingByKey);
+
+    // Bangun baris hasil per truk-hari
+    const rows = [];
+    for (const key in shipByKey) {
+      const s = shipByKey[key];
+      const ambigu = s.pabrik.size > 1;
+      const pabrik = ambigu ? [...s.pabrik].join(" / ") : [...s.pabrik][0];
+      const makanTx = makanByKey[key] || [];
+      const gradingTx = gradingByKey[key] || [];
+      const bayarMakan = makanTx.length;
+      const bayarGrading = gradingTx.length;
+      let statusMakan = "netral", statusGrading = "netral";
+      if (!ambigu) {
+        const rateMakan = statMakan[pabrik] ? statMakan[pabrik].dibayar / statMakan[pabrik].shipment : 0;
+        const rateGrading = statGrading[pabrik] ? statGrading[pabrik].dibayar / statGrading[pabrik].shipment : 0;
+        const biasaDibayarMakan = rateMakan >= 0.5;
+        const biasaDibayarGrading = rateGrading >= 0.5;
+        if (bayarMakan > s.count) statusMakan = "lebih";
+        else if (biasaDibayarMakan && bayarMakan < s.count) statusMakan = "kurang";
+        else if (!biasaDibayarMakan && bayarMakan > 0) statusMakan = "cek";
+        else statusMakan = "ok";
+        if (bayarGrading > s.count) statusGrading = "lebih";
+        else if (biasaDibayarGrading && bayarGrading < s.count) statusGrading = "kurang";
+        else if (!biasaDibayarGrading && bayarGrading > 0) statusGrading = "cek";
+        else statusGrading = "ok";
+      }
+      rows.push({
+        ts: s.ts, plat: s.plat, pabrik, supir: [...s.supir].join(", "), kirim: s.count,
+        bayarMakan, statusMakan, makanTx,
+        bayarGrading, statusGrading, gradingTx,
+        ambigu
+      });
+    }
+    rows.sort((a, b) => b.ts - a.ts);
+    return { rows, statMakan, statGrading };
+  }
+
+  async function handleImportShipmentFile(file) {
+    try {
+      if (typeof XLSX === "undefined") {
+        alert("Gagal memuat komponen pembaca Excel. Coba muat ulang halaman dengan koneksi internet aktif.");
+        return;
+      }
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array" });
+      const shipments = parseShipmentWorkbook(wb);
+      if (!shipments.length) {
+        alert("Tidak ada data pengiriman terbaca. Pastikan file punya kolom 'TANGGAL' dan 'PLAT KENDARAAN'.");
+        return;
+      }
+      state.shipments = shipments;
+      saveState();
+      ui.toast = `Data pengiriman berhasil diimpor: ${shipments.length} baris`;
+      render();
+      setTimeout(() => { ui.toast = ""; render(); }, 2000);
+    } catch (err) {
+      console.error("Gagal impor data pengiriman:", err);
+      alert("Gagal membaca file ini: " + err.message);
+    }
+  }
+
   async function handleImportFile(file) {
     try {
       if (typeof XLSX === "undefined") {
@@ -526,7 +748,8 @@ const COA_MAP = {"1106.00.00":"PERSEDIAAN","1106.01.00":"PERSEDIAAN BAHAN BAKAR"
     { key: "dashboard", label: "Dashboard", icon: "M4 13h6V4H4v9Zm0 7h6v-5H4v5Zm10 0h6V11h-6v9Zm0-16v5h6V4h-6Z" },
     { key: "transaksi", label: "Laporan Transaksi", icon: "M6 4h9l3 3v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1Zm8 8H8m8 4H8" },
     { key: "rekap", label: "Rekap per Akun", icon: "M4 19h16M7 15v4M12 9v10M17 5v14" },
-    { key: "laporan", label: "Laporan Kas", icon: "M4 5h16v14H4V5Zm3 4h10M7 12h10M7 15h6" }
+    { key: "laporan", label: "Laporan Kas", icon: "M4 5h16v14H4V5Zm3 4h10M7 12h10M7 15h6" },
+    { key: "rekonsiliasi", label: "Rekonsiliasi Kirim", icon: "M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" }
   ];
 
   function sidebarHtml() {
@@ -549,7 +772,12 @@ const COA_MAP = {"1106.00.00":"PERSEDIAAN","1106.01.00":"PERSEDIAAN BAHAN BAKAR"
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 21V9m0 0l-4 4m4-4l4 4M4 5h16"/></svg>
         Impor Excel
       </button>
+      <button class="erp-nav-item" id="nav-import-shipment">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 13h3l2-5h8l2 5h3M5 13v5h14v-5M8 18v2m8-2v2"/></svg>
+        Impor Data Kirim
+      </button>
       <input type="file" id="f-import" accept=".xlsx" style="display:none">
+      <input type="file" id="f-import-shipment" accept=".xlsx" style="display:none">
     </div>`;
   }
 
@@ -631,12 +859,107 @@ const COA_MAP = {"1106.00.00":"PERSEDIAAN","1106.01.00":"PERSEDIAAN BAHAN BAKAR"
       <div class="erp-card">${accountBreakdownHtml(flow.tx, null)}</div>`;
   }
 
+  function statusBadge(status) {
+    const map = {
+      ok: ["Sesuai", "var(--success-bg)", "var(--success)"],
+      lebih: ["Kelebihan bayar", "var(--danger-bg)", "var(--danger)"],
+      kurang: ["Belum dibayar", "var(--danger-bg)", "var(--danger)"],
+      cek: ["Di luar pola biasa", "#FFF4D6", "#8A6100"],
+      netral: ["-", "var(--bg, #F0F1F3)", "var(--ink-faint)"]
+    };
+    const [label, bg, color] = map[status] || map.netral;
+    return `<span style="background:${bg};color:${color};font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:999px;white-space:nowrap">${label}</span>`;
+  }
+
+  function pageRekonsiliasi() {
+    const recon = computeReconciliation();
+    if (!recon) {
+      return `
+        <div class="erp-section-title">Rekonsiliasi Pengiriman vs Pembayaran</div>
+        <div class="erp-card" style="text-align:center;padding:40px 20px">
+          <div style="font-size:14px;color:var(--ink-soft);margin-bottom:16px">Belum ada data pengiriman diimpor.</div>
+          <button class="erp-btn-outline" id="btn-import-shipment-inline" style="margin:0 auto">Impor Data Pengiriman</button>
+        </div>`;
+    }
+    const { rows, statMakan, statGrading } = recon;
+    const issues = rows.filter(r => !r.ambigu && (r.statusMakan === "lebih" || r.statusMakan === "kurang" || r.statusGrading === "lebih" || r.statusGrading === "kurang"));
+    const perlucek = rows.filter(r => r.ambigu);
+
+    const statRows = Object.keys(statMakan).map(p => {
+      const m = statMakan[p], g = statGrading[p] || { shipment: m.shipment, dibayar: 0 };
+      return `<tr>
+        <td class="acc-name">${p}</td>
+        <td class="num">${m.shipment}</td>
+        <td class="num">${(m.dibayar / m.shipment * 100).toFixed(0)}%</td>
+        <td class="num">${(g.dibayar / g.shipment * 100).toFixed(0)}%</td>
+      </tr>`;
+    }).join("");
+
+    const rowsHtml = rows.slice(0, 100).map((r, i) => {
+      const rkey = "recon" + i;
+      const isIssue = !r.ambigu && (r.statusMakan === "lebih" || r.statusMakan === "kurang" || r.statusGrading === "lebih" || r.statusGrading === "kurang");
+      const open = ui.reconOpen[rkey] !== undefined ? ui.reconOpen[rkey] : isIssue;
+      const detailMakan = r.makanTx.length
+        ? r.makanTx.map(t => `<div style="padding:6px 0;border-top:1px solid var(--line);font-size:12.5px">${t.tanggal} — ${t.ket} <b>(${fmt(t.jumlah)})</b></div>`).join("")
+        : `<div style="padding:6px 0;border-top:1px solid var(--line);font-size:12.5px;color:var(--ink-faint)">Tidak ada pembayaran uang makan ditemukan untuk truk & tanggal ini.</div>`;
+      const detailGrading = r.gradingTx.length
+        ? r.gradingTx.map(t => `<div style="padding:6px 0;border-top:1px solid var(--line);font-size:12.5px">${t.tanggal} — ${t.ket} <b>(${fmt(t.jumlah)})</b></div>`).join("")
+        : `<div style="padding:6px 0;border-top:1px solid var(--line);font-size:12.5px;color:var(--ink-faint)">Tidak ada pembayaran grading ditemukan untuk truk & tanggal ini.</div>`;
+      return `
+      <div style="border-bottom:1px solid var(--line)">
+        <button data-reconkey="${rkey}" style="width:100%;background:none;border:none;text-align:left;padding:12px 0;display:flex;justify-content:space-between;align-items:center;gap:12px">
+          <div style="display:flex;align-items:center;gap:12px;min-width:0">
+            <span class="erp-tx-date">${new Date(r.ts).toLocaleDateString("id-ID", { day: "2-digit", month: "short", timeZone: "UTC" })}</span>
+            <div style="min-width:0">
+              <div class="erp-tx-ket">${r.plat}${r.supir ? " • " + r.supir : ""} ${r.ambigu ? "⚠️ ke 2 pabrik hari ini" : "→ " + r.pabrik}</div>
+              <div class="erp-tx-meta">Kirim ${r.kirim}x • Uang makan dibayar ${r.bayarMakan}x • Grading dibayar ${r.bayarGrading}x</div>
+            </div>
+          </div>
+          <div style="display:flex;gap:6px;flex-shrink:0;align-items:center">
+            ${r.ambigu ? `<span style="background:#FFF4D6;color:#8A6100;font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:999px">Cek manual</span>` : statusBadge(r.statusMakan) + statusBadge(r.statusGrading)}
+            <span style="color:var(--ink-faint);font-size:12px;transition:transform 0.15s;${open ? "" : "transform:rotate(-90deg)"}">▾</span>
+          </div>
+        </button>
+        ${open ? `
+        <div style="background:#FAFAFB;border-radius:10px;padding:12px 14px;margin-bottom:12px">
+          <div style="font-size:11.5px;font-weight:700;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.03em;margin-bottom:2px">📋 Data pengiriman (sumber: file rekap kirim)</div>
+          <div style="font-size:12.5px;padding:6px 0">Tanggal ${new Date(r.ts).toLocaleDateString("id-ID", { day: "2-digit", month: "long", year: "numeric", timeZone: "UTC" })} — truk <b>${r.plat}</b>${r.supir ? " (supir: " + r.supir + ")" : ""} kirim <b>${r.kirim}x</b> ke <b>${r.pabrik}</b></div>
+          <div style="font-size:11.5px;font-weight:700;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.03em;margin:10px 0 2px">🍽️ Pembayaran UANG MAKAN di Kas Kebun (${r.bayarMakan}x)</div>
+          ${detailMakan}
+          <div style="font-size:11.5px;font-weight:700;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.03em;margin:10px 0 2px">📦 Pembayaran UANG GRADING di Kas Kebun (${r.bayarGrading}x)</div>
+          ${detailGrading}
+        </div>` : ""}
+      </div>`;
+    }).join("");
+
+    return `
+      <div class="erp-section-title">Rekonsiliasi Pengiriman vs Pembayaran</div>
+      <div class="erp-grid-4" style="margin-bottom:20px">
+        <div class="erp-stat-card"><div class="icon-wrap">🚚</div><div><div class="label">Total truk-hari</div><div class="value">${rows.length}</div></div></div>
+        <div class="erp-stat-card"><div class="icon-wrap">⚠️</div><div><div class="label">Perlu ditinjau</div><div class="value">${issues.length}</div></div></div>
+        <div class="erp-stat-card"><div class="icon-wrap">❓</div><div><div class="label">Ambigu (2 pabrik)</div><div class="value">${perlucek.length}</div></div></div>
+        <div class="erp-stat-card"><div class="icon-wrap">📄</div><div><div class="label">Data pengiriman</div><div class="value">${state.shipments.length} baris</div></div></div>
+      </div>
+
+      <div class="erp-section-title">Pola pembayaran per pabrik (dari histori)</div>
+      <div class="erp-card" style="margin-bottom:20px">
+        <table class="erp-table">
+          <thead><tr><th>Pabrik</th><th class="num">Jumlah kirim</th><th class="num">% dapat uang makan</th><th class="num">% dapat grading</th></tr></thead>
+          <tbody>${statRows}</tbody>
+        </table>
+      </div>
+
+      <div class="erp-section-title">Detail per truk-hari (terbaru dulu)</div>
+      <div class="erp-card">${rowsHtml}</div>`;
+  }
+
   function render() {
     const flow = scopedFlow();
     let pageContent = "";
     if (ui.page === "transaksi") pageContent = pageTransaksi(flow);
     else if (ui.page === "rekap") pageContent = pageRekap(flow);
     else if (ui.page === "laporan") pageContent = pageLaporan(flow);
+    else if (ui.page === "rekonsiliasi") pageContent = pageRekonsiliasi();
     else pageContent = pageDashboard(flow);
 
     root.innerHTML = `
@@ -680,6 +1003,19 @@ const COA_MAP = {"1106.00.00":"PERSEDIAAN","1106.01.00":"PERSEDIAAN BAHAN BAKAR"
     if (q("f-import")) q("f-import").onchange = (e) => {
       const file = e.target.files[0];
       if (file) handleImportFile(file);
+    };
+    if (q("nav-import-shipment")) q("nav-import-shipment").onclick = () => q("f-import-shipment").click();
+    document.querySelectorAll("[data-reconkey]").forEach(b => b.onclick = () => {
+      const k = b.dataset.reconkey;
+      const chev = b.querySelector("span[style*='transition']");
+      const currentlyOpen = chev ? !chev.style.transform.includes("rotate") : false;
+      ui.reconOpen[k] = !currentlyOpen;
+      render();
+    });
+    if (q("btn-import-shipment-inline")) q("btn-import-shipment-inline").onclick = () => q("f-import-shipment").click();
+    if (q("f-import-shipment")) q("f-import-shipment").onchange = (e) => {
+      const file = e.target.files[0];
+      if (file) handleImportShipmentFile(file);
     };
     if (q("kk-import-cancel")) q("kk-import-cancel").onclick = () => { ui.importPreview = null; render(); };
     if (q("kk-import-overlay")) q("kk-import-overlay").addEventListener("click", (e) => { if (e.target.id === "kk-import-overlay") { ui.importPreview = null; render(); } });
